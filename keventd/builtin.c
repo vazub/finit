@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <syslog.h>
 #include <unistd.h>
 
@@ -82,49 +83,70 @@ static int builtin_kmod(struct uevent *ev, int argc, char **argv)
 /* ---- hwdb -------------------------------------------------------- */
 
 /*
+ * Longest lookup key.  DMI and input modaliases routinely run past 256
+ * bytes, so keep this generous.
+ */
+#define HWDB_KEY_MAX 1024
+
+/*
  * Match a single text hwdb file against the lookup key.
- * Text format: match lines at column 0, property lines indented.
- * Empty lines or lines starting with '#' reset the match state.
  *
- * Multiple consecutive match lines OR-merge: if any of the match lines
- * matches the lookup key, the following property block applies.  The
- * group ends when we see a property line followed by another match
- * line (start of next group), or a blank/comment line.
+ * The file format follows hwdb(7) and the systemd-hwdb compiler:
+ *
+ *  - Lines are stripped of leading and trailing whitespace (so CRLF files
+ *    work) before they are classified.
+ *  - Lines starting with '#' are comments.  They are skipped and never
+ *    affect the state of the record being read, even in the middle of one.
+ *  - An empty (or whitespace-only) line ends the current record.
+ *  - A line indented with a space is a KEY=VALUE property of the current
+ *    record; any other line is a match pattern.
+ *
+ * Multiple consecutive match lines OR-merge: if any of them matches the
+ * lookup key, the property block that follows applies.  A match line after
+ * a property line starts the next record.
  */
 static void hwdb_match_file(const char *path, const char *lookup,
 			     struct uevent *ev)
 {
-	char  line[1024];
-	int   matched = 0;
-	int   in_props = 0;	/* saw a property line for the current group */
-	FILE *fp;
+	char   *line = NULL;
+	size_t  cap  = 0;
+	int     matched  = 0;
+	int     in_props = 0;	/* saw a property line for the current group */
+	FILE   *fp;
 
 	fp = fopen(path, "r");
 	if (!fp)
 		return;
 
-	while (fgets(line, sizeof(line), fp)) {
-		line[strcspn(line, "\n")] = '\0';
+	while (getline(&line, &cap, fp) > 0) {
+		int   indented = (line[0] == ' ' || line[0] == '\t');
+		char *s = line, *end;
 
-		if (!line[0] || line[0] == '#') {
+		while (isspace((unsigned char)*s))
+			s++;
+		end = s + strlen(s);
+		while (end > s && isspace((unsigned char)end[-1]))
+			*--end = '\0';
+
+		if (*s == '#')
+			continue;
+
+		if (!*s) {
 			matched  = 0;
 			in_props = 0;
 			continue;
 		}
 
-		if (isspace((unsigned char)line[0])) {
-			char *p, *eq;
+		if (indented) {
+			char *eq;
 
 			if (!matched)
 				continue;
-			p  = line;
-			while (isspace((unsigned char)*p))
-				p++;
-			eq = strchr(p, '=');
-			if (!eq)
+			eq = strchr(s, '=');
+			if (!eq || eq == s)
 				continue;
 			*eq = '\0';
-			uevent_setenv(ev, p, eq + 1);
+			uevent_setenv(ev, s, eq + 1);
 			in_props = 1;
 		} else {
 			/* Match line.  If we just finished a property block,
@@ -134,20 +156,22 @@ static void hwdb_match_file(const char *path, const char *lookup,
 				matched  = 0;
 				in_props = 0;
 			}
-			if (fnmatch(line, lookup, 0) == 0)
+			if (fnmatch(s, lookup, 0) == 0)
 				matched = 1;
 		}
 	}
 
+	free(line);
 	fclose(fp);
 }
 
 /*
  * Build the hwdb lookup key for input devices.
  *
- * udev hwdb files use the format:
- *   evdev:input:b{BUS}v{VENDOR}p{PRODUCT}e{VERSION}*
- * where all fields are 4-digit uppercase hex.
+ * udev hwdb files match against "evdev:" plus the sysfs modalias:
+ *   evdev:input:b{BUS}v{VENDOR}p{PRODUCT}e{VERSION}-e{CAPABILITIES...}
+ * where the IDs are 4-digit uppercase hex.  If the device has no modalias
+ * attribute, the part up to and including the version is built from id/.
  *
  * The id/ files live under the input device directory.  For eventN nodes
  * (devpath ends in .../inputN/eventN) we strip the last component first.
@@ -156,7 +180,8 @@ static void hwdb_input_key(const struct uevent *ev, char *key, size_t len)
 {
 	char base[PATH_MAX];
 	char path[PATH_MAX];
-	char bus_s[8], vendor_s[8], product_s[8], version_s[8];
+	char bus_s[8] = "", vendor_s[8] = "", product_s[8] = "", version_s[8] = "";
+	char mod[HWDB_KEY_MAX - 8];
 
 	if (!ev->devpath)
 		return;
@@ -180,11 +205,38 @@ static void hwdb_input_key(const struct uevent *ev, char *key, size_t len)
 		snprintf(path, sizeof(path), "/sys%s", ev->devpath);
 	}
 
-	snprintf(base, sizeof(base), "%s/id/vendor",  path); sysfs_read_file(base, vendor_s,  sizeof(vendor_s));
-	snprintf(base, sizeof(base), "%s/id/product",  path); sysfs_read_file(base, product_s, sizeof(product_s));
-	snprintf(base, sizeof(base), "%s/id/version",  path); sysfs_read_file(base, version_s, sizeof(version_s));
+	/*
+	 * Prefer the kernel's own modalias.  Unlike the id/ files it carries
+	 * the capability bitmaps (-e0,1,...,k110,...,r0,1,...) that some hwdb
+	 * entries match on, and it is the string the stock udev rules use:
+	 *
+	 *   IMPORT{builtin}="hwdb 'evdev:$attr{modalias}'"
+	 */
+	snprintf(base, sizeof(base), "%s/modalias", path);
+	if (sysfs_read_file(base, mod, sizeof(mod)) == 0 &&
+	    !strncmp(mod, "input:", 6)) {
+		size_t n = strlen(mod);
 
-	snprintf(key, len, "evdev:input:b%04Xv%04Xp%04Xe%04X*",
+		while (n && isspace((unsigned char)mod[n - 1]))
+			mod[--n] = '\0';
+		if (snprintf(key, len, "evdev:%s", mod) < (int)len)
+			return;
+		key[0] = '\0';
+	}
+
+	/* Otherwise build the key from the id/ files. */
+	/* A device without a full id/ set has no usable key. */
+	snprintf(base, sizeof(base), "%s/id/vendor", path);
+	if (sysfs_read_file(base, vendor_s, sizeof(vendor_s)) < 0)
+		return;
+	snprintf(base, sizeof(base), "%s/id/product", path);
+	if (sysfs_read_file(base, product_s, sizeof(product_s)) < 0)
+		return;
+	snprintf(base, sizeof(base), "%s/id/version", path);
+	if (sysfs_read_file(base, version_s, sizeof(version_s)) < 0)
+		return;
+
+	snprintf(key, len, "evdev:input:b%04Xv%04Xp%04Xe%04X",
 		 (unsigned)strtoul(bus_s,     NULL, 16),
 		 (unsigned)strtoul(vendor_s,  NULL, 16),
 		 (unsigned)strtoul(product_s, NULL, 16),
@@ -231,84 +283,225 @@ static void hwdb_usb_key(const struct uevent *ev, char *key, size_t len)
 		 (unsigned)strtoul(product_s, NULL, 16));
 }
 
-static void hwdb_scan(const char *key, struct uevent *ev)
+/*
+ * The hwdb files of all search path directories are combined the way udev
+ * does it:
+ *
+ *  - every *.hwdb file is processed in one global order by file name,
+ *    not directory by directory, so /etc/udev/hwdb.d/10-foo.hwdb is read
+ *    before /usr/lib/udev/hwdb.d/60-bar.hwdb and the latter wins;
+ *  - a file in a higher priority directory masks a same-named file in a
+ *    lower priority one, so an empty file or a symlink to /dev/null in
+ *    /etc disables a stock file.
+ *
+ * Later properties override earlier ones.
+ */
+struct hwdb_file {
+	char       *path;	/* full path, heap-allocated */
+	const char *name;	/* basename, points into path */
+};
+
+static int hwdb_file_cmp(const void *a, const void *b)
 {
-	static const char *dirs[] = {
+	return strcmp(((const struct hwdb_file *)a)->name,
+		      ((const struct hwdb_file *)b)->name);
+}
+
+static void hwdb_files_free(struct hwdb_file *files, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		free(files[i].path);
+	free(files);
+}
+
+/*
+ * List the *.hwdb files on the search path, one per file name, lowest
+ * priority directory first.  Returns -1 on out-of-memory.
+ */
+static int hwdb_collect(struct hwdb_file **out, size_t *nout)
+{
+	static const char *const dirs[] = {
 		"/lib/udev/hwdb.d",
+		"/usr/lib/udev/hwdb.d",
 		"/run/udev/hwdb.d",
 		"/etc/udev/hwdb.d",
 		NULL
 	};
-	int i;
+	struct stat        seen[sizeof(dirs) / sizeof(dirs[0])];
+	struct hwdb_file  *files = NULL;
+	size_t             n = 0, cap = 0, nseen = 0, k;
+	int                i;
 
 	for (i = 0; dirs[i]; i++) {
-		struct dirent **entries;
-		int             n, j;
+		struct dirent *de;
+		struct stat    st;
+		int            dup = 0;
+		DIR           *d;
 
-		n = scandir(dirs[i], &entries, NULL, alphasort);
-		if (n < 0)
+		if (stat(dirs[i], &st) || !S_ISDIR(st.st_mode))
 			continue;
 
-		for (j = 0; j < n; j++) {
-			const char *name = entries[j]->d_name;
-			size_t      nlen = strlen(name);
+		/* /lib is usually a symlink to /usr/lib, read it only once */
+		for (k = 0; k < nseen; k++)
+			if (seen[k].st_dev == st.st_dev &&
+			    seen[k].st_ino == st.st_ino)
+				dup = 1;
+		if (dup)
+			continue;
+		seen[nseen++] = st;
 
-			if (nlen > 5 && !strcmp(name + nlen - 5, ".hwdb")) {
-				char path[PATH_MAX];
+		d = opendir(dirs[i]);
+		if (!d)
+			continue;
 
-				snprintf(path, sizeof(path), "%s/%s", dirs[i], name);
-				hwdb_match_file(path, key, ev);
+		while ((de = readdir(d))) {
+			size_t      nlen = strlen(de->d_name);
+			char        path[PATH_MAX];
+			const char *name;
+			char       *p;
+
+			if (nlen <= 5 || strcmp(de->d_name + nlen - 5, ".hwdb"))
+				continue;
+
+			snprintf(path, sizeof(path), "%s/%s", dirs[i], de->d_name);
+			p = strdup(path);
+			if (!p) {
+				closedir(d);
+				goto oom;
 			}
-			free(entries[j]);
+			name = p + strlen(dirs[i]) + 1;
+
+			for (k = 0; k < n; k++)
+				if (!strcmp(files[k].name, name))
+					break;
+			if (k < n) {	/* mask the lower priority file */
+				free(files[k].path);
+				files[k].path = p;
+				files[k].name = name;
+				continue;
+			}
+
+			if (n == cap) {
+				size_t            ncap = cap ? cap * 2 : 16;
+				struct hwdb_file *nf;
+
+				nf = realloc(files, ncap * sizeof(*files));
+				if (!nf) {
+					free(p);
+					closedir(d);
+					goto oom;
+				}
+				files = nf;
+				cap   = ncap;
+			}
+			files[n].path = p;
+			files[n].name = name;
+			n++;
 		}
-		free(entries);
+		closedir(d);
 	}
+
+	*out  = files;
+	*nout = n;
+	return 0;
+oom:
+	hwdb_files_free(files, n);
+	return -1;
+}
+
+static void hwdb_scan(const char *key, struct uevent *ev)
+{
+	struct hwdb_file *files = NULL;
+	size_t            n = 0, i;
+
+	if (hwdb_collect(&files, &n)) {
+		logit(LOG_ERR, "rules: hwdb: out of memory");
+		return;
+	}
+
+	qsort(files, n, sizeof(*files), hwdb_file_cmp);
+	for (i = 0; i < n; i++)
+		hwdb_match_file(files[i].path, key, ev);
+
+	hwdb_files_free(files, n);
+}
+
+/*
+ * Store prefix+tail in key.  A key that does not fit is not truncated (a
+ * cut-off key would silently fail to match anything); it is rejected.
+ */
+static int hwdb_set_key(char *key, size_t len, const char *prefix,
+			const char *tail)
+{
+	int n = snprintf(key, len, "%s%s", prefix ? prefix : "", tail);
+
+	if (n < 0 || (size_t)n >= len) {
+		logit(LOG_WARNING,
+		      "rules: hwdb key too long (%d bytes, max %zu), lookup skipped",
+		      n, len - 1);
+		key[0] = '\0';
+		return -1;
+	}
+	return 0;
 }
 
 static int builtin_hwdb(struct uevent *ev, int argc, char **argv)
 {
 	const char *subsys = NULL;
 	const char *prefix = NULL;
-	char        key[256] = "";
+	const char *explicit_key = NULL;
+	char        key[HWDB_KEY_MAX] = "";
 	int         i;
 
-	/* Parse --subsystem=X and --lookup-prefix=Y */
+	/*
+	 * Parse --subsystem=X and --lookup-prefix=Y.  The first non-option
+	 * argument is the lookup key itself, which is how the stock udev
+	 * rules use the builtin:
+	 *
+	 *   IMPORT{builtin}="hwdb 'evdev:name:$attr{name}:$attr{[dmi/id]modalias}'"
+	 */
 	for (i = 1; i < argc; i++) {
 		if (!strncmp(argv[i], "--subsystem=", 12))
 			subsys = argv[i] + 12;
 		else if (!strncmp(argv[i], "--lookup-prefix=", 16))
 			prefix = argv[i] + 16;
+		else if (argv[i][0] != '-' && !explicit_key)
+			explicit_key = argv[i];
 	}
 	if (!subsys)
 		subsys = ev->subsystem;
 
-	if (subsys && !strcmp(subsys, "input")) {
-		hwdb_input_key(ev, key, sizeof(key));
-	} else if (subsys && (!strcmp(subsys, "usb") ||
-			      !strcmp(subsys, "usb_device"))) {
-		hwdb_usb_key(ev, key, sizeof(key));
-	}
+	/*
+	 * --lookup-prefix scopes a key taken from the argument or from
+	 * MODALIAS.  Keys synthesised from sysfs already carry their own type
+	 * prefix (evdev:input:, usb:) and are used as they are.
+	 */
+	if (explicit_key) {
+		if (hwdb_set_key(key, sizeof(key), prefix, explicit_key))
+			return 0;
+	} else {
+		if (subsys && !strcmp(subsys, "input")) {
+			hwdb_input_key(ev, key, sizeof(key));
+		} else if (subsys && (!strcmp(subsys, "usb") ||
+				      !strcmp(subsys, "usb_device"))) {
+			hwdb_usb_key(ev, key, sizeof(key));
+		}
 
-	/* Fall back to MODALIAS / ev->modalias for pci, platform, etc. */
-	if (!key[0]) {
-		const char *m = uevent_getenv(ev, "MODALIAS");
+		/* Fall back to MODALIAS / ev->modalias for pci, platform, etc. */
+		if (!key[0]) {
+			const char *m = uevent_getenv(ev, "MODALIAS");
 
-		if (!m)
-			m = ev->modalias;
-		if (m)
-			snprintf(key, sizeof(key), "%s", m);
+			if (!m)
+				m = ev->modalias;
+			if (m && hwdb_set_key(key, sizeof(key), prefix, m))
+				return 0;
+		}
 	}
 
 	if (!key[0])
 		return 0;
-
-	/* --lookup-prefix scopes the match by prepending to the key. */
-	if (prefix && *prefix) {
-		char tmp[sizeof(key)];
-
-		snprintf(tmp, sizeof(tmp), "%s%s", prefix, key);
-		snprintf(key, sizeof(key), "%s", tmp);
-	}
 
 	logit(LOG_DEBUG, "rules: hwdb lookup: %s", key);
 	hwdb_scan(key, ev);
@@ -1471,28 +1664,42 @@ int builtin_run(struct uevent *ev, const char *cmd)
 		if (!*p)
 			break;
 
-		/* shell-style quoting: '...' or "..." consume the quotes */
-		if (*p == '\'' || *p == '"') {
-			q = *p++;
-		}
-
+		/*
+		 * shell-style quoting: '...' or "..." may start anywhere in
+		 * a word and the quotes themselves are removed, so both
+		 * 'a b' and 'a 'b work.
+		 */
 		argv[argc++] = out = p;
 		while (*p) {
 			if (q) {
 				if (*p == q) {
+					q = 0;
 					p++;
-					break;
+					continue;
 				}
+			} else if (*p == '\'' || *p == '"') {
+				q = *p++;
+				continue;
 			} else if (isspace((unsigned char)*p)) {
 				break;
 			}
 			*out++ = *p++;
 		}
+		if (q)
+			logit(LOG_WARNING,
+			      "rules: unterminated quote in builtin command '%s'", cmd);
 		if (*p)
 			p++;
 		*out = '\0';
 	}
 	argv[argc] = NULL;
+
+	while (isspace((unsigned char)*p))
+		p++;
+	if (*p)
+		logit(LOG_WARNING,
+		      "rules: too many arguments in builtin command '%s', rest ignored",
+		      cmd);
 
 	if (!argc)
 		return -1;
